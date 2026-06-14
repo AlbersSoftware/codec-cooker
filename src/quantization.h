@@ -21,37 +21,37 @@ static const float JPEG_LUMA[64] = {
 };
 
 struct QuantCoeffEntry {
-  float original;      // raw DCT coefficient
-  float step;          // step size used
-  int level;           // quantized integer level
-  float reconstructed; // dequantized value
-  float error;         // original - reconstructed
+  float original;
+  float step;
+  int level;
+  float reconstructed;
+  float error;
 };
 
 struct QuantResult {
   int blockIndex;
   int blockSize;
-  std::vector<QuantCoeffEntry> entries; // one per coefficient
+  std::vector<QuantCoeffEntry> entries;
   float psnr;
   double estimatedBits;
   int nonzeroCount;
-  std::vector<float> reconPixels; // reconstructed pixel block
+  std::vector<float> reconPixels;
 };
 
-// Build step-size matrix for given mode, blockSize, baseQ, deadzoneScale
+// Build step-size matrix
 std::vector<float> BuildQuantMatrix(QuantMode mode, int blockSize, float baseQ,
                                     float deadzoneScale = 1.0f);
 
-// Quantize a single DCTBlock and return full per-coefficient breakdown
+// Quantize block
 QuantResult QuantizeBlock(const DCTBlock &block, int blockSize, QuantMode mode,
                           float baseQ, float deadzoneScale, bool useTrellis,
                           float lambda);
 
-// Reconstruct pixel block from quantized coefficients (IDCT)
+// Reconstruct pixels
 std::vector<float> ReconstructPixels(const std::vector<float> &dequantCoeffs,
                                      int blockSize);
 
-// Compute PSNR between original gray pixels and reconstructed
+// Compute PSNR
 float ComputePSNR(const std::vector<unsigned char> &orig,
                   const std::vector<float> &recon, int bx, int by,
                   int blockSize, int imgWidth, int imgHeight);
