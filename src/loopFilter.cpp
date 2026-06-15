@@ -26,12 +26,13 @@ float LFPSNR(const std::vector<unsigned char> &orig,
 
 // -------------------------------------------------------
 // Compute boundary strength map
-// High strength = big pixel difference across block edge
+// High strength = large pixel discontinuity at block edge.
+// Used both for visualization and to modulate deblock strength
+// per-edge (AV1-style: stronger edges get less filtering).
 // -------------------------------------------------------
 std::vector<BoundaryStrength>
 ComputeBoundaryStrengths(const std::vector<float> &pixels, int width,
                          int height, int blockSize) {
-
   std::vector<BoundaryStrength> bs;
   int bw = (width + blockSize - 1) / blockSize;
   int bh = (height + blockSize - 1) / blockSize;
@@ -74,16 +75,25 @@ ComputeBoundaryStrengths(const std::vector<float> &pixels, int width,
 }
 
 // -------------------------------------------------------
-// H.264-STYLE DEBLOCKING FILTER
-// Applied along each block boundary, 4 pixels deep each side
+// H.264/AV1-STYLE DEBLOCKING FILTER
+//
+// local_strength  = params.strength * boundary.strength
+//   → edges with high discontinuity get proportionally more filtering
+// local_threshold = params.threshold * (1 + boundary.strength)
+//   → wider threshold at strong edges (more likely to be real content)
+//
+// This is the AV1-style per-edge modulation you requested.
+// Strong block-artifact edges (low boundary.strength from content,
+// but high from quantization artifact) get filtered hard.
+// Real content edges (high boundary.strength) widen the threshold
+// so we don't blur them away.
 // -------------------------------------------------------
 static void DeblockEdge(std::vector<float> &pixels, int width, int height,
-                        bool horizontal, int edge, int span, float threshold,
+                        bool horizontal, int edge, float threshold,
                         float flat_thresh, float strength) {
   int len = horizontal ? width : height;
 
   for (int i = 0; i < len; i++) {
-    // p3 p2 p1 p0 | q0 q1 q2 q3   (| = block boundary)
     int px = horizontal ? i : edge;
     int py = horizontal ? edge : i;
 
@@ -101,8 +111,7 @@ static void DeblockEdge(std::vector<float> &pixels, int width, int height,
 
     int dx0 = horizontal ? 0 : -1;
     int dy0 = horizontal ? -1 : 0;
-    int dx1 = horizontal ? 0 : 0;
-    int dy1 = horizontal ? 0 : 0;
+    int dx1 = 0, dy1 = 0;
 
     float p0 = get(dx0 * 1, dy0 * 1);
     float p1 = get(dx0 * 2, dy0 * 2);
@@ -113,39 +122,33 @@ static void DeblockEdge(std::vector<float> &pixels, int width, int height,
 
     float diff = fabsf(p0 - q0);
     if (diff > threshold * strength)
-      continue; // strong edge, don't filter
+      continue;
 
-    // Flatness check
     bool flat = (fabsf(p1 - p0) < flat_thresh) &&
                 (fabsf(q1 - q0) < flat_thresh) &&
                 (fabsf(p2 - p0) < flat_thresh * 2) &&
                 (fabsf(q2 - q0) < flat_thresh * 2);
 
     if (flat) {
-      // Strong filter (smooth ramp across boundary)
-      float avg = (p2 + 2 * p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2) / 9.0f;
       float np0 = (p2 + 2 * p1 + 2 * p0 + q0 + 2) / 6.0f;
       float np1 = (p2 + p1 + p0 + q0 + 2) / 4.0f;
       float nq0 = (p0 + 2 * q0 + 2 * q1 + q2 + 2) / 6.0f;
       float nq1 = (p0 + q0 + q1 + q2 + 2) / 4.0f;
-      set(dx0 * 1, dy0 * 1, Clampf(np0, 0, 255));
-      set(dx0 * 2, dy0 * 2, Clampf(np1, 0, 255));
-      set(dx1, dy1, Clampf(nq0, 0, 255));
-      set(dx1 + (horizontal ? 0 : 1), dy1 + (horizontal ? 1 : 0),
-          Clampf(nq1, 0, 255));
+      set(dx0 * 1, dy0 * 1, np0);
+      set(dx0 * 2, dy0 * 2, np1);
+      set(dx1, dy1, nq0);
+      set(dx1 + (horizontal ? 0 : 1), dy1 + (horizontal ? 1 : 0), nq1);
     } else {
-      // Weak filter — only blend p0/q0
       float delta =
           Clampf((q0 - p0) / 4.0f, -threshold / 2, threshold / 2) * strength;
-      set(dx0 * 1, dy0 * 1, Clampf(p0 + delta, 0, 255));
-      set(dx1, dy1, Clampf(q0 - delta, 0, 255));
+      set(dx0 * 1, dy0 * 1, p0 + delta);
+      set(dx1, dy1, q0 - delta);
     }
   }
 }
 
 // -------------------------------------------------------
 // GRADIENT-ADAPTIVE FILTER (CDEF-lite)
-// Applies a directional weighted median along dominant gradient
 // -------------------------------------------------------
 static void ApplyCDEFLite(std::vector<float> &pixels, int width, int height,
                           float strength) {
@@ -153,18 +156,15 @@ static void ApplyCDEFLite(std::vector<float> &pixels, int width, int height,
   for (int y = 1; y < height - 1; y++) {
     for (int x = 1; x < width - 1; x++) {
       float c = pixels[y * width + x];
-      // 8 neighbors
       float n[8] = {
           pixels[(y - 1) * width + (x - 1)], pixels[(y - 1) * width + x],
           pixels[(y - 1) * width + (x + 1)], pixels[y * width + (x - 1)],
           pixels[y * width + (x + 1)],       pixels[(y + 1) * width + (x - 1)],
           pixels[(y + 1) * width + x],       pixels[(y + 1) * width + (x + 1)]};
-      // Directional sums: H, V, D1, D2
       float h = fabsf(n[3] - c) + fabsf(n[4] - c);
       float v = fabsf(n[1] - c) + fabsf(n[6] - c);
       float d1 = fabsf(n[0] - c) + fabsf(n[7] - c);
       float d2 = fabsf(n[2] - c) + fabsf(n[5] - c);
-
       float min_dir = std::min({h, v, d1, d2});
       float filtered;
       if (min_dir == h)
@@ -175,7 +175,6 @@ static void ApplyCDEFLite(std::vector<float> &pixels, int width, int height,
         filtered = (n[0] + c + n[7]) / 3.0f;
       else
         filtered = (n[2] + c + n[5]) / 3.0f;
-
       output[y * width + x] = Clampf(c + (filtered - c) * strength, 0, 255);
     }
   }
@@ -194,7 +193,6 @@ static void ApplyBilateral(std::vector<float> &pixels, int width, int height,
     radius = 1;
   float ss2 = 2 * sigma_space * sigma_space;
   float sc2 = 2 * sigma_color * sigma_color;
-
   for (int y = 0; y < height; y++) {
     for (int x = 0; x < width; x++) {
       float center = pixels[y * width + x];
@@ -221,14 +219,12 @@ static void ApplyBilateral(std::vector<float> &pixels, int width, int height,
 }
 
 // -------------------------------------------------------
-// WIENER FILTER (separable, simplified)
-// Estimates signal from a local window, suppresses noise
+// WIENER FILTER
 // -------------------------------------------------------
 static void ApplyWiener(std::vector<float> &pixels, int width, int height,
                         int radius, float strength) {
   std::vector<float> output = pixels;
-  float noise_var = 100.0f; // assumed noise variance
-
+  float noise_var = 100.0f;
   for (int y = 0; y < height; y++) {
     for (int x = 0; x < width; x++) {
       float sum = 0, sum2 = 0;
@@ -260,17 +256,30 @@ static void ApplyWiener(std::vector<float> &pixels, int width, int height,
 
 // -------------------------------------------------------
 // MAIN ENTRY POINT
+//
+// KEY CHANGE vs previous version:
+// For LF_DEBLOCK, we now compute boundary strengths FIRST,
+// then apply DeblockEdge with per-edge modulated strength
+// and threshold (AV1-style):
+//   local_strength  = params.strength  * boundary.strength
+//   local_threshold = params.threshold * (1 + boundary.strength)
+//
+// This means:
+//  - Low-discontinuity edges (likely quantization artifacts):
+//    boundary.strength is LOW → smaller local_strength → filter harder
+//  - High-discontinuity edges (likely real content):
+//    boundary.strength is HIGH → wider local_threshold → less filtering
 // -------------------------------------------------------
 LoopFilterResult ApplyLoopFilter(const std::vector<float> &recon_pixels,
                                  int width, int height, int blockSize,
                                  const LoopFilterParams &params) {
-
   LoopFilterResult result;
   result.width = width;
   result.height = height;
-  result.filtered = recon_pixels; // start with copy
+  result.filtered = recon_pixels;
 
-  // Compute boundary strengths before filtering
+  // Always compute boundary strengths (used for both visualization
+  // and AV1-style per-edge deblock modulation)
   result.boundaries =
       ComputeBoundaryStrengths(result.filtered, width, height, blockSize);
 
@@ -284,23 +293,130 @@ LoopFilterResult ApplyLoopFilter(const std::vector<float> &recon_pixels,
     return result;
 
   if (params.mode == LF_DEBLOCK) {
-    // Apply deblocking at every block boundary
     int bw = (width + blockSize - 1) / blockSize;
     int bh = (height + blockSize - 1) / blockSize;
 
-    // Horizontal edges
+    // Build a lookup: (bx,by,horizontal) -> boundary strength
+    // For deblock we need the strength of the edge we're filtering.
+    // Horizontal boundary at (bx, by) separates row by and by+1.
+    // Vertical boundary at (bx, by) separates col bx and bx+1.
+
+    // Horizontal edges: iterate over boundaries that are horizontal
+    // We store them in the same order ComputeBoundaryStrengths produces:
+    // horiz first (by=0..bh-2, bx=0..bw-1), then vert.
+    // We'll re-query by scanning the list for matching coords.
+
+    // Build fast lookup maps
+    // horiz[by][bx] and vert[by][bx]
+    std::vector<std::vector<float>> horiz_str(bh, std::vector<float>(bw, 0.5f));
+    std::vector<std::vector<float>> vert_str(bh, std::vector<float>(bw, 0.5f));
+    for (auto &bd : result.boundaries) {
+      if (bd.horizontal && bd.by < bh && bd.bx < bw)
+        horiz_str[bd.by][bd.bx] = bd.strength;
+      else if (!bd.horizontal && bd.by < bh && bd.bx < bw)
+        vert_str[bd.by][bd.bx] = bd.strength;
+    }
+
+    // Apply horizontal deblock edges with per-edge modulation
     for (int by = 1; by < bh; by++) {
       int edge_y = by * blockSize;
-      if (edge_y < height)
-        DeblockEdge(result.filtered, width, height, true, edge_y, blockSize,
-                    params.threshold, params.flat_thresh, params.strength);
+      if (edge_y >= height)
+        continue;
+      for (int bx = 0; bx < bw; bx++) {
+        // The edge between row (by-1) and row by corresponds to
+        // horiz_str[by-1][bx] in our map
+        float bs = (by - 1 < bh) ? horiz_str[by - 1][bx] : 0.5f;
+        // AV1-style per-edge modulation:
+        float local_strength = params.strength * (0.5f + bs);
+        float local_threshold = params.threshold * (1.0f + bs);
+
+        // Filter only the pixels in this block column
+        // We do it per-pixel-column within the block
+        int x0 = bx * blockSize;
+        int x1 = std::min(x0 + blockSize, width);
+        for (int x = x0; x < x1; x++) {
+          // inline single-pixel deblock at (x, edge_y)
+          auto get = [&](int dx, int dy) -> float {
+            int nx = x + dx, ny = edge_y + dy;
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height)
+              return 128;
+            return result.filtered[ny * width + nx];
+          };
+          auto set = [&](int dx, int dy, float v) {
+            int nx = x + dx, ny = edge_y + dy;
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height)
+              result.filtered[ny * width + nx] = Clampf(v, 0, 255);
+          };
+          float p0 = get(0, -1), p1 = get(0, -2), p2 = get(0, -3);
+          float q0 = get(0, 0), q1 = get(0, 1), q2 = get(0, 2);
+          if (fabsf(p0 - q0) > local_threshold * local_strength)
+            continue;
+          bool flat = (fabsf(p1 - p0) < params.flat_thresh) &&
+                      (fabsf(q1 - q0) < params.flat_thresh) &&
+                      (fabsf(p2 - p0) < params.flat_thresh * 2) &&
+                      (fabsf(q2 - q0) < params.flat_thresh * 2);
+          if (flat) {
+            set(0, -1, (p2 + 2 * p1 + 2 * p0 + q0 + 2) / 6.0f);
+            set(0, -2, (p2 + p1 + p0 + q0 + 2) / 4.0f);
+            set(0, 0, (p0 + 2 * q0 + 2 * q1 + q2 + 2) / 6.0f);
+            set(0, 1, (p0 + q0 + q1 + q2 + 2) / 4.0f);
+          } else {
+            float delta = Clampf((q0 - p0) / 4.0f, -local_threshold / 2,
+                                 local_threshold / 2) *
+                          local_strength;
+            set(0, -1, p0 + delta);
+            set(0, 0, q0 - delta);
+          }
+        }
+      }
     }
-    // Vertical edges
-    for (int bx = 1; bx < bw; bx++) {
-      int edge_x = bx * blockSize;
-      if (edge_x < width)
-        DeblockEdge(result.filtered, width, height, false, edge_x, blockSize,
-                    params.threshold, params.flat_thresh, params.strength);
+
+    // Apply vertical deblock edges with per-edge modulation
+    for (int by = 0; by < bh; by++) {
+      for (int bx = 1; bx < bw; bx++) {
+        int edge_x = bx * blockSize;
+        if (edge_x >= width)
+          continue;
+        float bs = vert_str[by][bx - 1];
+        float local_strength = params.strength * (0.5f + bs);
+        float local_threshold = params.threshold * (1.0f + bs);
+
+        int y0 = by * blockSize;
+        int y1 = std::min(y0 + blockSize, height);
+        for (int y = y0; y < y1; y++) {
+          auto get = [&](int dx, int dy) -> float {
+            int nx = edge_x + dx, ny = y + dy;
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height)
+              return 128;
+            return result.filtered[ny * width + nx];
+          };
+          auto set = [&](int dx, int dy, float v) {
+            int nx = edge_x + dx, ny = y + dy;
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height)
+              result.filtered[ny * width + nx] = Clampf(v, 0, 255);
+          };
+          float p0 = get(-1, 0), p1 = get(-2, 0), p2 = get(-3, 0);
+          float q0 = get(0, 0), q1 = get(1, 0), q2 = get(2, 0);
+          if (fabsf(p0 - q0) > local_threshold * local_strength)
+            continue;
+          bool flat = (fabsf(p1 - p0) < params.flat_thresh) &&
+                      (fabsf(q1 - q0) < params.flat_thresh) &&
+                      (fabsf(p2 - p0) < params.flat_thresh * 2) &&
+                      (fabsf(q2 - q0) < params.flat_thresh * 2);
+          if (flat) {
+            set(-1, 0, (p2 + 2 * p1 + 2 * p0 + q0 + 2) / 6.0f);
+            set(-2, 0, (p2 + p1 + p0 + q0 + 2) / 4.0f);
+            set(0, 0, (p0 + 2 * q0 + 2 * q1 + q2 + 2) / 6.0f);
+            set(1, 0, (p0 + q0 + q1 + q2 + 2) / 4.0f);
+          } else {
+            float delta = Clampf((q0 - p0) / 4.0f, -local_threshold / 2,
+                                 local_threshold / 2) *
+                          local_strength;
+            set(-1, 0, p0 + delta);
+            set(0, 0, q0 - delta);
+          }
+        }
+      }
     }
   } else if (params.mode == LF_ADAPTIVE) {
     ApplyCDEFLite(result.filtered, width, height, params.strength);

@@ -3,7 +3,6 @@
 #include <cmath>
 #include <vector>
 
-// ===== QUANT MODES =====
 enum QuantMode {
   QUANT_FLAT = 0,
   QUANT_JPEG = 1,
@@ -12,7 +11,6 @@ enum QuantMode {
   QUANT_CUSTOM = 4,
 };
 
-// Standard JPEG luma quantization matrix
 static const float JPEG_LUMA[64] = {
     16, 11, 10, 16, 24,  40,  51,  61,  12, 12, 14, 19, 26,  58,  60,  55,
     14, 13, 16, 24, 40,  57,  69,  56,  14, 17, 22, 29, 51,  87,  80,  62,
@@ -38,20 +36,21 @@ struct QuantResult {
   std::vector<float> reconPixels;
 };
 
-// Build step-size matrix
 std::vector<float> BuildQuantMatrix(QuantMode mode, int blockSize, float baseQ,
                                     float deadzoneScale = 1.0f);
 
-// Quantize block
 QuantResult QuantizeBlock(const DCTBlock &block, int blockSize, QuantMode mode,
                           float baseQ, float deadzoneScale, bool useTrellis,
                           float lambda);
 
-// Reconstruct pixels
 std::vector<float> ReconstructPixels(const std::vector<float> &dequantCoeffs,
                                      int blockSize);
 
-// Compute PSNR
 float ComputePSNR(const std::vector<unsigned char> &orig,
                   const std::vector<float> &recon, int bx, int by,
                   int blockSize, int imgWidth, int imgHeight);
+
+// Apply sign hiding to an already-quantized QuantResult.
+// Flips the last nonzero coefficient sign if needed to make
+// the sign parity even, saving 1 bit. Updates entries + reconPixels.
+void ApplySignHidingToResult(QuantResult &res);
