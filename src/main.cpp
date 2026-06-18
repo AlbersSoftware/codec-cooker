@@ -28,6 +28,7 @@
 #include "dct.h"
 #include "entropy.h"
 #include "loopFilter.h"
+#include "multiframe.h"
 #include "quantization.h"
 
 // =====================================================
@@ -43,7 +44,6 @@ int g_icon_h = 0;
 int g_tex_w = 0;
 int g_tex_h = 0;
 
-// CHANGE 1: Replace g_gray/g_rgba_orig/g_dct_blocks with YCbCr channel buffers
 std::vector<unsigned char> g_rgba_orig;
 
 // YCbCr channel buffers (BT.601 full-range, 4:4:4)
@@ -72,13 +72,23 @@ int g_block_size = 8;
 int g_selected_block = -1;
 
 // =====================================================
+// MULTI-FRAME STATE
+// =====================================================
+std::vector<MultiFrame> g_multi_frames;
+int g_multi_selected = 0;
+bool g_multi_experiment_run = false;
+bool g_multi_chain_run = false;
+// Multi-frame context models persist across Run Experiment calls
+// so re-running with new params restarts statistics cleanly.
+ContextModel g_multi_ctxY, g_multi_ctxCb, g_multi_ctxCr;
+
+// =====================================================
 // EXPERIMENT PARAMETERS
 // =====================================================
 
 // -- Quantization --
 QuantMode g_quant_mode = QUANT_FLAT;
 float g_base_q = 16.0f;
-// CHANGE 2: Add chroma QP offset
 float g_chroma_qp_offset = 4.0f; // Cb/Cr Q = base_q + offset
 float g_deadzone_scale = 1.5f;
 bool g_use_trellis = false;
@@ -103,7 +113,7 @@ LoopFilterResult g_lf_result;
 std::vector<unsigned char> g_recon_image;    // RGBA reconstructed
 std::vector<unsigned char> g_filtered_image; // RGBA loop-filtered
 
-// CHANGE 3: Per-channel PSNR
+// Per-channel PSNR
 float g_psnr_Y = 0, g_psnr_Cb = 0, g_psnr_Cr = 0, g_psnr_rgb = 0;
 
 // =====================================================
@@ -208,6 +218,44 @@ bool OpenFileDialog(char *outPath, size_t maxSize) {
   return GetOpenFileNameA(&ofn);
 }
 
+// Opens a multi-select dialog and returns one path per selected file.
+// Windows fills the buffer as: [optional dir][file1]\0[file2]\0 ... \0\0
+// when multiple files are chosen, or just the single full path (single
+// \0 terminator pair) when only one file is picked.
+std::vector<std::string> OpenMultiFileDialog() {
+  std::vector<std::string> result;
+  static char buf[1 << 16];
+  ZeroMemory(buf, sizeof(buf));
+  OPENFILENAMEA ofn;
+  ZeroMemory(&ofn, sizeof(ofn));
+  ofn.lStructSize = sizeof(ofn);
+  ofn.lpstrFilter = "Image Files\0*.png;*.jpg;*.jpeg;*.bmp\0All Files\0*.*\0";
+  ofn.lpstrFile = buf;
+  ofn.nMaxFile = sizeof(buf);
+  ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_EXPLORER |
+              OFN_ALLOWMULTISELECT;
+  if (!GetOpenFileNameA(&ofn))
+    return result;
+
+  std::string dir = buf;
+  const char *p = buf + dir.size() + 1;
+  if (*p == '\0') {
+    // Single file: the whole buffer IS the full path already.
+    result.push_back(dir);
+    return result;
+  }
+  while (*p) {
+    std::string fname = p;
+    std::string full = dir;
+    if (!full.empty() && full.back() != '\\')
+      full += '\\';
+    full += fname;
+    result.push_back(full);
+    p += fname.size() + 1;
+  }
+  return result;
+}
+
 bool SaveFileDialog(char *outPath, size_t maxSize, const char *filter,
                     const char *defExt) {
   OPENFILENAMEA ofn;
@@ -250,7 +298,7 @@ void DeleteTextureSafe(GLuint &tex) {
 }
 
 // =====================================================
-// CHANGE 4: YCbCr conversion helpers (BT.601 full-range)
+// YCbCr conversion helpers (BT.601 full-range)
 // =====================================================
 static unsigned char RGBtoY(unsigned char r, unsigned char g, unsigned char b) {
   return (unsigned char)Clampf(0.299f * r + 0.587f * g + 0.114f * b, 0, 255);
@@ -292,7 +340,7 @@ static float ChannelPSNR(const std::vector<unsigned char> &orig,
 }
 
 // =====================================================
-// CHANGE 5: ClearAll — add new channel clears
+// ClearAll
 // =====================================================
 void ClearAll() {
   DeleteTextureSafe(g_tex_original);
@@ -329,7 +377,19 @@ void ClearAll() {
 }
 
 // =====================================================
-// FILM GRAIN (unchanged)
+// ClearMultiFrames
+// =====================================================
+void ClearMultiFrames() {
+  for (auto &f : g_multi_frames)
+    FreeMultiFrameTextures(f);
+  g_multi_frames.clear();
+  g_multi_selected = 0;
+  g_multi_experiment_run = false;
+  g_multi_chain_run = false;
+}
+
+// =====================================================
+// FILM GRAIN
 // =====================================================
 static void ApplyFilmGrain(std::vector<unsigned char> &rgba_image, int width,
                            int height, float strength, int seed) {
@@ -351,7 +411,7 @@ static void ApplyFilmGrain(std::vector<unsigned char> &rgba_image, int width,
 }
 
 // =====================================================
-// CHANGE 6: LoadImage — split RGB into Y, Cb, Cr channels
+// LoadImage — split RGB into Y, Cb, Cr channels
 // =====================================================
 bool LoadImage(const char *filename) {
   int n;
@@ -391,7 +451,7 @@ bool LoadImage(const char *filename) {
 }
 
 // =====================================================
-// CHANGE 7: QuantizeChannel helper (new function)
+// QuantizeChannel helper
 // =====================================================
 static std::vector<QuantResult>
 QuantizeChannel(const std::vector<DCTBlock> &blocks,
@@ -421,7 +481,7 @@ QuantizeChannel(const std::vector<DCTBlock> &blocks,
 }
 
 // =====================================================
-// CHANGE 8: RunExperiment — quantize Y, Cb, Cr separately
+// RunExperiment — quantize Y, Cb, Cr separately
 // =====================================================
 void RunExperiment() {
   if (g_dct_blocks_Y.empty())
@@ -521,7 +581,7 @@ void RunExperiment() {
 }
 
 // =====================================================
-// CHANGE 9: RunChainPipeline — use Y float buffer, recombine color
+// RunChainPipeline — use Y float buffer, recombine color
 // =====================================================
 void RunChainPipeline() {
   if (!g_experiment_run || g_recon_Y.empty())
@@ -629,13 +689,7 @@ static void ExportEntropyCSV() {
   }
   f.close();
 }
-
 // WritePDF, ExportQuantPDF, ExportEntropyPDF, and main() continue in main2.cpp
-//
-// =====================================================
-// Continuation of main.cpp — paste after main1.cpp
-// =====================================================
-
 static void WritePDF(const char *path, const std::string &title,
                      const std::vector<std::string> &lines) {
   auto escape = [](const std::string &s) {
@@ -995,6 +1049,33 @@ int main(int, char **) {
         ClearAll();
     }
 
+    ImGui::SeparatorText("Multi-Frame Batch");
+    if (ImGui::Button("Open Multiple Images", ImVec2(-1, 28))) {
+      auto paths = OpenMultiFileDialog();
+      if (!paths.empty()) {
+        ClearMultiFrames();
+        std::vector<std::string> skipped;
+        g_multi_frames = LoadMultiFrames(paths, skipped);
+        g_multi_ctxY.Init(g_block_size);
+        g_multi_ctxCb.Init(g_block_size);
+        g_multi_ctxCr.Init(g_block_size);
+        if (!skipped.empty()) {
+          // Surface skip reasons in the console; the Multi-Frame tab
+          // also shows a count so this isn't silently swallowed.
+          printf("Skipped %zu file(s) due to load failure or size "
+                 "mismatch with the first loaded frame:\n",
+                 skipped.size());
+          for (auto &s : skipped)
+            printf("  %s\n", s.c_str());
+        }
+      }
+    }
+    if (!g_multi_frames.empty()) {
+      ImGui::Text("%d frame(s) loaded", (int)g_multi_frames.size());
+      if (ImGui::Button("Clear Batch", ImVec2(-1, 24)))
+        ClearMultiFrames();
+    }
+
     ImGui::SeparatorText("Block");
     static int bs_idx = 1;
     const char *bs_opts[] = {"4x4", "8x8", "16x16", "32x32"};
@@ -1002,7 +1083,6 @@ int main(int, char **) {
     if (ImGui::Combo("Size##bs", &bs_idx, bs_opts, 4)) {
       g_block_size = bs_vals[bs_idx];
       if (!g_Y.empty()) {
-        // CHANGE 13: recompute all three channels on block size change
         g_dct_blocks_Y = ComputeDCTBlocks(g_Y, g_tex_w, g_tex_h, g_block_size);
         g_dct_blocks_Cb =
             ComputeDCTBlocks(g_Cb, g_tex_w, g_tex_h, g_block_size);
@@ -1019,7 +1099,7 @@ int main(int, char **) {
     if (ImGui::Combo("Mode##qm", &qm, qmode_names, 5))
       g_quant_mode = (QuantMode)qm;
 
-    // CHANGE 10: Chroma QP offset slider (renamed Base Q to make room)
+    // Chroma QP offset slider (renamed Base Q to make room)
     ImGui::SliderFloat("Base Q (Y)", &g_base_q, 1.0f, 128.0f);
     ImGui::SliderFloat("Chroma QP Offset", &g_chroma_qp_offset, 0.0f, 32.0f);
     if (ImGui::IsItemHovered())
@@ -1108,7 +1188,7 @@ int main(int, char **) {
     if (!can_run)
       ImGui::EndDisabled();
 
-    // CHANGE 11: Summary stats — replace Avg PSNR with per-channel PSNR
+    // Summary stats — per-channel PSNR
     if (g_experiment_run) {
       ImGui::Separator();
       ImGui::TextColored(ImVec4(1, 1, 0.4f, 1), "Y  PSNR: %.2f dB", g_psnr_Y);
@@ -1148,7 +1228,7 @@ int main(int, char **) {
     ImGui::SameLine();
 
     // =====================================================
-    // MAIN PANEL — tabs
+    // MAIN PANEL — tabs (continues in main3.cpp)
     // =====================================================
     ImGui::BeginChild("Main", ImVec2(0, 0), true);
     if (ImGui::BeginTabBar("Tabs")) {
@@ -1483,7 +1563,7 @@ int main(int, char **) {
         ImGui::EndTabItem();
       }
 
-      // CHANGE 12: NEW TAB — YCbCr per-channel breakdown
+      // TAB: YCbCr — per-channel breakdown
       if (ImGui::BeginTabItem("YCbCr")) {
         if (!g_experiment_run) {
           ImGui::TextDisabled("Run an experiment to see channel breakdown.");
@@ -1648,7 +1728,7 @@ int main(int, char **) {
         ImGui::EndTabItem();
       }
 
-      // TAB: Entropy (unchanged except g_dct_blocks alias covers it)
+      // TAB: Entropy
       if (ImGui::BeginTabItem("Entropy")) {
         if (!g_experiment_run)
           ImGui::TextDisabled("Run an experiment first.");
@@ -1971,6 +2051,194 @@ int main(int, char **) {
         ImGui::EndTabItem();
       }
 
+      // =================================================
+      // TAB: Multi-Frame — batch of images through the same
+      // pipeline, with chain filters, sharing one accumulating
+      // entropy context across frames.
+      // =================================================
+      if (ImGui::BeginTabItem("Multi-Frame")) {
+        if (g_multi_frames.empty()) {
+          ImGui::TextDisabled(
+              "Open multiple images from the left panel to begin.\n"
+              "All frames must share the same dimensions as the first "
+              "one loaded; mismatched files are skipped.");
+        } else {
+          // Frame selector strip
+          ImGui::Text("Frame:");
+          ImGui::SameLine();
+          for (int i = 0; i < (int)g_multi_frames.size(); i++) {
+            ImGui::PushID(i);
+            bool isSel = (i == g_multi_selected);
+            if (isSel)
+              ImGui::PushStyleColor(ImGuiCol_Button, g_theme.primary);
+            if (ImGui::Button(std::to_string(i).c_str(), ImVec2(28, 24)))
+              g_multi_selected = i;
+            if (isSel)
+              ImGui::PopStyleColor();
+            ImGui::PopID();
+            if (i < (int)g_multi_frames.size() - 1)
+              ImGui::SameLine();
+          }
+
+          ImGui::Separator();
+          if (ImGui::Button("Run Experiment (All Frames)", ImVec2(260, 36))) {
+            g_multi_ctxY.Init(g_block_size);
+            g_multi_ctxCb.Init(g_block_size);
+            g_multi_ctxCr.Init(g_block_size);
+            RunMultiFrameExperiment(
+                g_multi_frames, g_block_size, g_quant_mode, g_base_q,
+                g_chroma_qp_offset, g_deadzone_scale, g_use_trellis,
+                g_trellis_lambda, use_sign_hiding, g_multi_ctxY, g_multi_ctxCb,
+                g_multi_ctxCr, g_entropy_model);
+            g_multi_experiment_run = true;
+            g_multi_chain_run = false;
+          }
+          ImGui::SameLine();
+          bool canChain = g_multi_experiment_run;
+          if (!canChain)
+            ImGui::BeginDisabled();
+          if (ImGui::Button("Run Chain (All Frames)", ImVec2(220, 36))) {
+            RunMultiFrameChain(g_multi_frames, g_block_size, g_chain_steps);
+            g_multi_chain_run = true;
+          }
+          if (!canChain)
+            ImGui::EndDisabled();
+
+          ImGui::TextDisabled(
+              "Uses the same Base Q / Chroma Offset / Quant Mode / Chain "
+              "steps configured in the left panel and Chain tab.");
+
+          if (g_multi_experiment_run) {
+            ImGui::Separator();
+            ImGui::Text("Per-Frame Quality");
+            double sumY = 0,
+                   sumChain = 0; // accumulated below, displayed after the table
+            if (ImGui::BeginTable("MultiFrameTable", g_multi_chain_run ? 6 : 5,
+                                  ImGuiTableFlags_Borders |
+                                      ImGuiTableFlags_RowBg |
+                                      ImGuiTableFlags_SizingFixedFit)) {
+              ImGui::TableSetupColumn("Frame", ImGuiTableColumnFlags_WidthFixed,
+                                      50);
+              ImGui::TableSetupColumn("Y PSNR",
+                                      ImGuiTableColumnFlags_WidthFixed, 80);
+              ImGui::TableSetupColumn("Cb PSNR",
+                                      ImGuiTableColumnFlags_WidthFixed, 80);
+              ImGui::TableSetupColumn("Cr PSNR",
+                                      ImGuiTableColumnFlags_WidthFixed, 80);
+              ImGui::TableSetupColumn("RGB PSNR",
+                                      ImGuiTableColumnFlags_WidthFixed, 80);
+              if (g_multi_chain_run)
+                ImGui::TableSetupColumn("Chain PSNR",
+                                        ImGuiTableColumnFlags_WidthFixed, 90);
+              ImGui::TableHeadersRow();
+
+              for (int i = 0; i < (int)g_multi_frames.size(); i++) {
+                auto &f = g_multi_frames[i];
+                ImGui::TableNextRow();
+                if (i == g_multi_selected)
+                  ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                         IM_COL32(60, 60, 30, 255));
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("%d", i);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextColored(ImVec4(1, 1, 0.4f, 1), "%.2f", f.psnrY);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextColored(ImVec4(0.4f, 0.8f, 1, 1), "%.2f", f.psnrCb);
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1), "%.2f", f.psnrCr);
+                ImGui::TableSetColumnIndex(4);
+                ImGui::Text("%.2f", f.psnrRgb);
+                sumY += f.psnrY;
+                if (g_multi_chain_run) {
+                  ImGui::TableSetColumnIndex(5);
+                  if (f.chainRun) {
+                    ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "%.2f",
+                                       f.chainPsnrY);
+                    sumChain += f.chainPsnrY;
+                  } else
+                    ImGui::TextDisabled("-");
+                }
+              }
+              ImGui::EndTable();
+            }
+
+            if (!g_multi_frames.empty()) {
+              ImGui::Text("Average Y PSNR across batch: %.2f dB",
+                          (float)(sumY / g_multi_frames.size()));
+              if (g_multi_chain_run)
+                ImGui::Text("Average Chain PSNR across batch: %.2f dB",
+                            (float)(sumChain / g_multi_frames.size()));
+            }
+            ImGui::Separator();
+
+            // Selected frame detail view
+            auto &sel = g_multi_frames[g_multi_selected];
+            ImGui::Text("Frame %d  (%dx%d)  %s", g_multi_selected, sel.width,
+                        sel.height, sel.path.c_str());
+
+            int numPanels = g_multi_chain_run ? 3 : 2;
+            float avail =
+                ImGui::GetContentRegionAvail().x - (numPanels - 1) * 8.0f;
+            float panelW = avail / numPanels;
+            float sc = panelW / (float)sel.width;
+            float dw = sel.width * sc, dh = sel.height * sc;
+
+            ImGui::Text("Original");
+            ImGui::SameLine(panelW + 8);
+            ImGui::Text("Reconstructed");
+            if (g_multi_chain_run) {
+              ImGui::SameLine(panelW * 2 + 16);
+              ImGui::Text("Chained");
+            }
+            if (sel.texOriginal)
+              ImGui::Image((ImTextureID)(intptr_t)sel.texOriginal,
+                           ImVec2(dw, dh));
+            ImGui::SameLine();
+            if (sel.texRecon)
+              ImGui::Image((ImTextureID)(intptr_t)sel.texRecon, ImVec2(dw, dh));
+            if (g_multi_chain_run && sel.texChain) {
+              ImGui::SameLine();
+              ImGui::Image((ImTextureID)(intptr_t)sel.texChain, ImVec2(dw, dh));
+            }
+
+            if (g_multi_chain_run && !sel.chainResults.empty()) {
+              ImGui::Separator();
+              ImGui::Text("Chain stages for this frame:");
+              if (ImGui::BeginTable("MultiChainStages", 3,
+                                    ImGuiTableFlags_Borders |
+                                        ImGuiTableFlags_RowBg |
+                                        ImGuiTableFlags_SizingFixedFit)) {
+                ImGui::TableSetupColumn("Stage",
+                                        ImGuiTableColumnFlags_WidthFixed, 150);
+                ImGui::TableSetupColumn("PSNR (dB)",
+                                        ImGuiTableColumnFlags_WidthFixed, 90);
+                ImGui::TableSetupColumn("Gain (dB)",
+                                        ImGuiTableColumnFlags_WidthFixed, 90);
+                ImGui::TableHeadersRow();
+                for (auto &stage : sel.chainResults) {
+                  ImGui::TableNextRow();
+                  ImGui::TableSetColumnIndex(0);
+                  ImGui::Text("%s", stage.label.c_str());
+                  ImGui::TableSetColumnIndex(1);
+                  ImGui::Text("%.2f", stage.psnr);
+                  ImGui::TableSetColumnIndex(2);
+                  if (stage.psnr_gain > 0.001f)
+                    ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "+%.3f",
+                                       stage.psnr_gain);
+                  else if (stage.psnr_gain < -0.001f)
+                    ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%.3f",
+                                       stage.psnr_gain);
+                  else
+                    ImGui::TextDisabled("0.000");
+                }
+                ImGui::EndTable();
+              }
+            }
+          }
+        }
+        ImGui::EndTabItem();
+      }
+
       // TAB: Heatmaps
       if (ImGui::BeginTabItem("Heatmaps")) {
         if (g_dct_blocks_Y.empty())
@@ -2027,6 +2295,8 @@ int main(int, char **) {
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     SDL_GL_SwapWindow(window);
   }
+
+  ClearMultiFrames();
 
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplSDL3_Shutdown();
